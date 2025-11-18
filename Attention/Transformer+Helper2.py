@@ -1,4 +1,4 @@
-# helper_transformer_improved.py
+# helper_transformer_improved
 import numpy as np
 import pandas as pd
 from pynwb import NWBHDF5IO
@@ -13,7 +13,7 @@ from tensorflow.keras import layers, models
 from tensorflow.keras.callbacks import EarlyStopping
 
 # -----------------------------
-# Ore-processing pipleine functions
+# Utilities 
 # -----------------------------
 def bandpass_filter(data, lowcut=1, highcut=100, fs=1000, order=4):
     nyq = 0.5 * fs
@@ -208,41 +208,65 @@ class HelperTrainer(tf.keras.Model):
         return [self.loss_tracker, self.cls_acc]
 
     def call(self, inputs, training=False):
+        """
+        The call method is sued to pass the input into the helper method.
+        The output of the helper method is then passed through the transformer model
+        """
         # forward only returns logits (so .predict works as normal)
         helper_out = self.helper(inputs, training=training)
         logits = self.transformer(helper_out, training=False)
         return logits
 
     def compute_focal(self, y_true, y_pred):
+        """
+        Calculates the asymmetric focal loss
+        :param y_true: ground truth label
+        :param y_pred: model's predicted probability of the positive class
+        :return: average asymmetrical focal loss across all batches
+        """
         # y_pred expected in [0,1], shape (batch,)
-        y_true = tf.cast(y_true, tf.float32)
-        bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
-        p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
-        alpha = y_true * self.f_alpha_0 + (1 - y_true) * self.f_alpha_1
-        focal = alpha * tf.pow(1 - p_t, self.f_gamma) * bce
-        return tf.reduce_mean(focal)
+        y_true = tf.cast(y_true, tf.float32) #Convert y_true to floats
+        bce = tf.keras.losses.binary_crossentropy(y_true, y_pred) #Calculate binary cross entropy
+        p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred) #Probability of true class. Picks y_pred if the true label is 1, else picks 1 - y_pred
+        alpha = y_true * self.f_alpha_0 + (1 - y_true) * self.f_alpha_1 #Add class weighting (alpha_0, and alpha_1)
+        focal = alpha * tf.pow(1 - p_t, self.f_gamma) * bce #Calculates the asymmetric focal loss
+        return tf.reduce_mean(focal) #Averages asymmetric focal loss over a batch
 
     def compute_margin(self, y_true, emb_pred):
-        # emb_pred shape (batch, emb_dim)
-        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
-        # build ref per-sample
-        ref0 = tf.reshape(self.class_center_0, (1, -1))
-        ref1 = tf.reshape(self.class_center_1, (1, -1))
-        ref0_batch = tf.repeat(ref0, tf.shape(emb_pred)[0], axis=0)
-        ref1_batch = tf.repeat(ref1, tf.shape(emb_pred)[0], axis=0)
-        mask = tf.cast(tf.expand_dims(tf.equal(y_true, 1), axis=1), tf.float32)
-        ref_batch = mask * ref1_batch + (1.0 - mask) * ref0_batch
-        mse = tf.reduce_mean(tf.reduce_sum(tf.square(emb_pred - ref_batch), axis=1))
+        # Embeddings, for instance = [[0.9, 1.1], [1.0, 0.0], [0.2, 0.3]], where batch size = 3 and y_true = [1, 0, 1]
+        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.int32) #Ensure that all true labels are integers (0,1)
+        #Class centers for class 0 are like [0.5, 0.6], class  like [1.0, 1.2], then
+        ref0 = tf.reshape(self.class_center_0, (1, -1)) #Reshape 0 class centers to make them 2D of dim: (1, emb_dim). Ex [0.5, 0.6] to [[0.5, 0.6]]
+        ref1 = tf.reshape(self.class_center_1, (1, -1)) #Reshape 1 class centers to make them 2D of dim: (1, emb_dim). Ex [1.0, 1.2] to [[1.0, 1.2]]
+        ref0_batch = tf.repeat(ref0, tf.shape(emb_pred)[0], axis=0) #Create batch sized version of class 0 center so that it can be compared to every sample.
+        # Ex:
+        # [[0.5, 0.6],
+        # [0.5, 0.6],
+        # [0.5, 0.6]]
+        ref1_batch = tf.repeat(ref1, tf.shape(emb_pred)[0], axis=0) #Create batch sized version of class 1 center so that it can be compared to every sample
+        # Ex:
+        # [[1.0, 1.2],
+        # [1.0, 1.2],
+        # [1.0, 1.2]]
+        mask = tf.cast(tf.expand_dims(tf.equal(y_true, 1), axis=1), tf.float32) #Mask 1 for class 1, 0 for class 0. Ex. y_true = [1,0,1], mask = [[1], [0], [1]]
+        ref_batch = mask * ref1_batch + (1.0 - mask) * ref0_batch #For each batch, pick ref1 if label = 1, ref0 if label = 0
+        # Ex: ref_batch
+        # [[1.0, 1.2], -->true label 1
+        # [0.5, 0.6],  -->true label 0
+        # [1.0, 1.2]]  -->true label 1
+        mse = tf.reduce_mean(tf.reduce_sum(tf.square(emb_pred - ref_batch), axis=1)) #Calculate the squared distance between predicted and actual centers. distance formula
+        # (x2-x1)^2 + (y2-y1)2
+        # Ex: [[0.02], [0.61], [1.45]], mean = (0.02 + 0.61 + 1.45)/3
         return mse
 
     def train_step(self, data):
         x, y = data  # x: inputs, y: labels
 
-        with tf.GradientTape() as tape:
-            helper_out = self.helper(x, training=True)               # (batch, T, E)
-            logits = self.transformer(helper_out, training=False)    # (batch, 1)
-            logits = tf.reshape(logits, [-1])                        # (batch,)
-            emb_pred = self.embedding_model(helper_out, training=False)  # (batch, emb_dim)
+        with tf.GradientTape() as tape: #Tensor flow used to calculate all gradients in this block
+            helper_out = self.helper(x, training=True)               # Pass input through helper. Output dim: (batch, T, E)
+            logits = self.transformer(helper_out, training=False)    # Pass helper output to transformer (batch, 1). Freeze transformer
+            logits = tf.reshape(logits, [-1])                 # shape logits from (batch, 1) to (batch,)
+            emb_pred = self.embedding_model(helper_out, training=False)  #generate embeddings using embedding_head. Output dim: (batch, emb_dim)
 
             # compute classification loss (asymmetric focal)
             cls_loss = self.compute_focal(y, logits)
@@ -251,8 +275,8 @@ class HelperTrainer(tf.keras.Model):
             total_loss = cls_loss + self.lambda_margin * emb_loss
 
         # gradients only for helper parameters
-        grads = tape.gradient(total_loss, self.helper.trainable_variables)
-        self.optimizer.apply_gradients(zip(grads, self.helper.trainable_variables))
+        grads = tape.gradient(total_loss, self.helper.trainable_variables) #Compute gradients for total loss only with helper's parameters
+        self.optimizer.apply_gradients(zip(grads, self.helper.trainable_variables)) #Update helper parameters using computed gradients and optimizer
 
         # update metrics
         self.loss_tracker.update_state(total_loss)
@@ -261,15 +285,16 @@ class HelperTrainer(tf.keras.Model):
         return {"loss": self.loss_tracker.result(), "acc": self.cls_acc.result()}
 
     def test_step(self, data):
-        x, y = data
-        helper_out = self.helper(x, training=False)
-        logits = self.transformer(helper_out, training=False)
-        logits = tf.reshape(logits, [-1])
-        emb_pred = self.embedding_model(helper_out, training=False)
-        cls_loss = self.compute_focal(y, logits)
-        emb_loss = self.compute_margin(y, emb_pred)
-        total_loss = cls_loss + self.lambda_margin * emb_loss
+        x, y = data #X = data, y = labels
+        helper_out = self.helper(x, training=False) #pass inputs into helper
+        logits = self.transformer(helper_out, training=False) #Pass helper output to transforme. Freexe transfirmerr
+        logits = tf.reshape(logits, [-1]) #Reshape (batch, 1) to (batch, )
+        emb_pred = self.embedding_model(helper_out, training=False) #Get embeddings
+        cls_loss = self.compute_focal(y, logits) #Compute focal loss
+        emb_loss = self.compute_margin(y, emb_pred) #Compute matgin loss
+        total_loss = cls_loss + self.lambda_margin * emb_loss #Compute total loss
 
+        #Track loss and accuracy evaluation
         self.loss_tracker.update_state(total_loss)
         self.cls_acc.update_state(y, logits)
         return {"loss": self.loss_tracker.result(), "acc": self.cls_acc.result()}
@@ -278,7 +303,7 @@ class HelperTrainer(tf.keras.Model):
 # threshold search utility
 # -----------------------------
 def find_best_threshold(y_true, probs, target='class0_f1'):
-    # scans thresholds and returns best threshold and its f1 (for class0 or macro)
+    # scans thresholds and returns the best threshold and its f1 (for class0 or macro)
     best_t = 0.5
     best_score = -1.0
     tgrid = np.linspace(0.01, 0.99, 99)
@@ -331,6 +356,7 @@ if __name__ == "__main__":
     transformer.trainable = False
 
     # embedding extractor
+    #Embedding layer is the penultimate layer of the frozen transformer
     embedding_model = models.Model(transformer.input, transformer.get_layer('transformer_embedding').output)
     # compute class centers in embedding space (from transformer's view on raw scaled inputs)
     embeddings_train = embedding_model.predict(X_train_scaled, batch_size=64)
@@ -367,14 +393,14 @@ if __name__ == "__main__":
         preds = (probs >= threshold).astype(int)
         return probs, preds
 
-    # baseline (0.5)
+    # 6) Accuracy evaluation with baseline threshold of 0.5
     probs_05, preds_05 = predict_with_helper(helper, transformer, X_test_scaled, threshold=0.5)
     print("\n--- results at threshold 0.5 ---")
     print(classification_report(y_test, preds_05, digits=3))
     cm = confusion_matrix(y_test, preds_05)
     print("Confusion matrix:\n", cm)
 
-    # 6) find threshold that maximizes class-0 F1
+    # 7) find threshold that maximizes class-0 F1. Do accuracy evaluation again
     best_t, best_f1 = find_best_threshold(y_test, probs_05, target='class0_f1')
     print(f"\nBest threshold (class0 f1) = {best_t:.3f}, f1 = {best_f1:.3f}")
 
@@ -392,8 +418,8 @@ if __name__ == "__main__":
     plt.title(f"Helper+Transformer (threshold={best_t:.3f})")
     plt.show()
 
-    ##SANITY CHECK
-    #Calculate the majority ratio
+    # 8) SANITY CHECK: Reality chance check
+    # Calculate the majority ratio
     unique, counts = np.unique(y, return_counts=True)
     class_counts = dict(zip(unique, counts))
     majority_class = unique[np.argmax(counts)]
@@ -420,6 +446,13 @@ if __name__ == "__main__":
     else:
         print("Sanity Check passed")
         print("Scrambled Accuracy:", acc_scrambled)
+
+
+
+
+
+
+
 
 
 
